@@ -1,0 +1,28 @@
+services:
+  drain-api:
+    build: .
+    image: drain-coordinator:local
+    container_name: drain-api
+    ports:
+      - "8000:8000"
+    environment:
+      DRAIN_DB_PATH: /data/drain.db
+      DRAIN_WORKERS: "2"
+      DRAIN_LOG_LEVEL: info
+    volumes:
+      - drain-data:/data
+    restart: unless-stopped
+    stop_grace_period: 10s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  drain-data:
