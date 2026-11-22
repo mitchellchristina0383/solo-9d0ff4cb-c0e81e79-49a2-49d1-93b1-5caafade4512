@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class WorkloadUpsert(BaseModel):
@@ -147,3 +147,67 @@ class StatusOut(BaseModel):
 class HealthOut(BaseModel):
     status: Literal["ok"]
     database: str
+
+
+# ---------------------------------------------------------------------------
+# Node inventory reconciliation
+# ---------------------------------------------------------------------------
+
+
+class InventorySubmit(BaseModel):
+    uids: list[str] = Field(
+        description=(
+            "Complete list of pod uids the agent currently observes on the "
+            "node. Scope members still active here that are missing are "
+            "retired; an empty list means the node reports no pods."
+        ),
+    )
+
+    @field_validator("uids")
+    @classmethod
+    def _validate_uids(cls, value: list[str]) -> list[str]:
+        if any(not isinstance(uid, str) or not (1 <= len(uid) <= 253) for uid in value):
+            raise ValueError("every uid must be a non-empty string of at most 253 characters")
+        if len(set(value)) != len(value):
+            raise ValueError("uids must not contain duplicates")
+        return value
+
+
+class SettledTaskRef(BaseModel):
+    task_id: str
+    pod_uid: str
+    workload: str
+    result_note: str | None = None
+
+
+class InventoryReceipt(BaseModel):
+    retired_uids: list[str]
+    settled_tasks: list[SettledTaskRef]
+    unknown_uids: list[str] = Field(
+        description=(
+            "Submitted uids the coordinator has never registered. Uids of "
+            "already-retired pods are not listed here (they are known uids)."
+        ),
+    )
+
+
+class InventoryOut(BaseModel):
+    inventory_id: str
+    node: str
+    seq: int
+    state: Literal["open", "completed", "superseded"]
+    scope: list[str] = Field(
+        description="Uids active on the node when the inventory was issued.",
+    )
+    submitted_uids: list[str] | None = Field(
+        default=None,
+        description="The exact uid list submitted; null while the inventory is open.",
+    )
+    created_at: str
+    updated_at: str
+    completed_at: str | None = None
+    receipt: InventoryReceipt | None = None
+    duplicate: bool = Field(
+        default=False,
+        description="True when this response replays a previously applied submission.",
+    )

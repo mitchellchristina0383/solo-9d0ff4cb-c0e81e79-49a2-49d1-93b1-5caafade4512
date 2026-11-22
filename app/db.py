@@ -73,6 +73,40 @@ CREATE TABLE IF NOT EXISTS report_events (
     response_json TEXT NOT NULL,
     received_at   TEXT NOT NULL
 );
+
+-- A node inventory ("reconciliation") is a two-phase fence used when a node
+-- agent reconnects.  Issue time freezes the scope (uids active on the node
+-- then); submit time retires scope members that are still active but missing
+-- from the agent's actual uid list.  ``seq`` is per-node and monotonic: when a
+-- later inventory for the same node completes, older still-open inventories
+-- are marked superseded and their late submissions are rejected.
+CREATE TABLE IF NOT EXISTS inventories (
+    id            TEXT PRIMARY KEY,
+    node          TEXT NOT NULL,
+    seq           INTEGER NOT NULL,
+    state         TEXT NOT NULL CHECK (state IN ('open', 'completed', 'superseded')),
+    scope_json    TEXT NOT NULL,
+    uids_json     TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    completed_at  TEXT,
+    UNIQUE(node, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_inventories_node_seq
+    ON inventories(node, seq);
+
+-- The receipt is written in the same transaction as the retirement it
+-- describes, so an inventory is either fully effective or not effective at
+-- all, and the original receipt survives a restart for exact replays.
+CREATE TABLE IF NOT EXISTS inventory_receipts (
+    inventory_id          TEXT PRIMARY KEY REFERENCES inventories(id),
+    node                  TEXT NOT NULL,
+    retired_uids_json     TEXT NOT NULL,
+    settled_tasks_json    TEXT NOT NULL,
+    unknown_uids_json     TEXT NOT NULL,
+    payload_json          TEXT NOT NULL,
+    created_at            TEXT NOT NULL
+);
 """
 
 

@@ -18,6 +18,8 @@ from .models import (
     EvictionResultOut,
     EvictionTaskOut,
     HealthOut,
+    InventoryOut,
+    InventorySubmit,
     NodeOut,
     PodOut,
     PodUpsert,
@@ -47,6 +49,13 @@ workload keeps enough ready replicas.
 * Reports are fenced by an optional idempotency `report_id` and by task
   identity. A report for an already-settled task is acknowledged but changes
   nothing, and can never touch a newer task or resurrect a removed pod.
+* **Node inventory reconciliation** lets a reconnecting agent prove which pods
+  still exist. Issuing an inventory freezes the node's active-pod scope; the
+  agent then submits the complete uid list it observes. Scope members still
+  active but missing are retired with their in-flight evictions settled by the
+  manual-removal rule, all in one atomic transaction with the receipt. A later
+  inventory supersedes older open ones, replays return the original receipt,
+  and conflicting re-submissions get a 409.
 """
 
 
@@ -151,6 +160,86 @@ def put_node(name: str, draining: bool | None = Query(default=None)) -> NodeOut:
 @app.get("/nodes", response_model=list[NodeOut], tags=["nodes"])
 def get_nodes() -> list[NodeOut]:
     return service.list_nodes()
+
+
+# ---------------------------------------------------------------------------
+# Node inventory reconciliation
+
+
+@app.post(
+    "/nodes/{name}/inventories",
+    response_model=InventoryOut,
+    tags=["inventories"],
+    status_code=status.HTTP_201_CREATED,
+    summary="Issue an inventory id for a reconnecting node",
+    description=(
+        "Freezes the inventory scope: the uids active on the node at issue "
+        "time. The node agent then submits the complete uid list it actually "
+        "observes via the submit endpoint. Inventory ids are per-node and "
+        "monotonic; completing a later inventory supersedes older open ones."
+    ),
+)
+def post_inventory(name: str) -> InventoryOut:
+    try:
+        return service.issue_inventory(name)
+    except Exception as exc:
+        raise _http(exc)
+
+
+@app.post(
+    "/nodes/{name}/inventories/{inventory_id}/submit",
+    response_model=InventoryOut,
+    tags=["inventories"],
+    summary="Submit the node's observed uid list for an issued inventory",
+    description=(
+        "Retires scope members still active but missing from `uids`, settling "
+        "their in-flight evictions by the manual-removal rule; pods registered "
+        "after issue time are retained. Retirement, task settlement and the "
+        "receipt commit atomically. Replaying the same list returns the "
+        "original receipt (`duplicate: true`); a different list on a completed "
+        "inventory is a 409, and a superseded inventory is rejected."
+    ),
+)
+def post_inventory_submit(name: str, inventory_id: str, body: InventorySubmit) -> InventoryOut:
+    try:
+        inv = service.get_inventory(inventory_id)
+    except service.NotFound:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"inventory {inventory_id!r} not found",
+        )
+    if inv.node != name:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"inventory {inventory_id!r} does not belong to node {name!r}",
+        )
+    try:
+        return service.submit_inventory(inventory_id, body.uids)
+    except Exception as exc:
+        raise _http(exc)
+
+
+@app.get(
+    "/nodes/{name}/inventories",
+    response_model=list[InventoryOut],
+    tags=["inventories"],
+    summary="List inventories issued for a node (newest first)",
+)
+def get_node_inventories(name: str) -> list[InventoryOut]:
+    return service.list_inventories(node=name)
+
+
+@app.get(
+    "/inventories/{inventory_id}",
+    response_model=InventoryOut,
+    tags=["inventories"],
+    summary="Fetch one inventory and (once completed) its receipt",
+)
+def get_inventory(inventory_id: str) -> InventoryOut:
+    try:
+        return service.get_inventory(inventory_id)
+    except Exception as exc:
+        raise _http(exc)
 
 
 # ---------------------------------------------------------------------------

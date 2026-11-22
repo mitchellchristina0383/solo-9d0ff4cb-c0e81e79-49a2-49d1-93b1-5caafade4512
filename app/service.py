@@ -41,9 +41,12 @@ from .models import (
     ClaimResponse,
     EvictionResultIn,
     EvictionTaskOut,
+    InventoryOut,
+    InventoryReceipt,
     NodeOut,
     PodOut,
     PodUpsert,
+    SettledTaskRef,
     StatusOut,
     WaitingPod,
     WorkloadOut,
@@ -435,6 +438,35 @@ def list_pods(
         conn.close()
 
 
+def _retire_active_pod(
+    conn: sqlite3.Connection, uid: str, *, note: str, ts: str
+) -> list[sqlite3.Row]:
+    """Retire one pod by the manual-removal rule.
+
+    The pod is marked ``removed`` and every eviction still dispatched against
+    it is settled as ``aborted`` with *note*.  Returns the task rows that were
+    settled (normally zero or one, since only one open task per pod exists).
+    Caller must already hold a write transaction.
+    """
+    settled = conn.execute(
+        "SELECT * FROM eviction_tasks"
+        " WHERE pod_uid = ? AND status = 'dispatched' ORDER BY created_at, id",
+        (uid,),
+    ).fetchall()
+    conn.execute(
+        "UPDATE eviction_tasks SET status = 'aborted', updated_at = ?,"
+        " resolved_at = ?, result_note = ?"
+        " WHERE pod_uid = ? AND status = 'dispatched'",
+        (ts, ts, note, uid),
+    )
+    conn.execute(
+        "UPDATE pods SET state = 'removed', ready = 0, updated_at = ?,"
+        " retired_at = ? WHERE uid = ?",
+        (ts, ts, uid),
+    )
+    return settled
+
+
 def remove_pod(uid: str) -> PodOut:
     """Explicitly retire a pod (e.g. it was deleted out of band)."""
     conn = _connect()
@@ -444,18 +476,7 @@ def remove_pod(uid: str) -> PodOut:
             if row is None:
                 raise NotFound(f"pod {uid!r} not found")
             if row["state"] != REMOVED:
-                ts = now_iso()
-                conn.execute(
-                    "UPDATE eviction_tasks SET status = 'aborted', updated_at = ?,"
-                    " resolved_at = ?, result_note = 'pod_removed'"
-                    " WHERE pod_uid = ? AND status = 'dispatched'",
-                    (ts, ts, uid),
-                )
-                conn.execute(
-                    "UPDATE pods SET state = 'removed', ready = 0, updated_at = ?,"
-                    " retired_at = ? WHERE uid = ?",
-                    (ts, ts, uid),
-                )
+                _retire_active_pod(conn, uid, note="pod_removed", ts=now_iso())
             row = conn.execute("SELECT * FROM pods WHERE uid = ?", (uid,)).fetchone()
             return _pod_out(conn, row)
     finally:
@@ -704,6 +725,250 @@ def record_eviction_result(
             }
             _store_report(conn, body.report_id, "eviction", task_id, payload)
             return payload
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Node inventory reconciliation
+#
+# Two-phase protocol for a node agent reconnecting after a disconnect:
+#
+# 1. ``issue_inventory`` hands out a per-node monotonic inventory id and
+#    freezes the *scope*: the uids active on that node at issue time.
+# 2. ``submit_inventory`` receives the agent's complete observed uid list and
+#    retires exactly the scope members that are still active but absent from
+#    that list, settling their in-flight evictions by the manual-removal rule.
+#    Pods registered after issue time are outside the scope and survive.
+#
+# Retirement, task settlement and the receipt are one ``BEGIN IMMEDIATE``
+# transaction: any failure rolls everything back, so the original state is
+# preserved and the submission can be retried.  A later inventory completing
+# for the same node fences off (supersedes) older still-open inventories.
+# ---------------------------------------------------------------------------
+
+
+INVENTORY_SUPERSEDED = "superseded"
+INVENTORY_NOTE = "inventory_missing"
+
+
+def _inventory_out(
+    row: sqlite3.Row,
+    receipt_row: sqlite3.Row | None,
+    *,
+    duplicate: bool = False,
+) -> InventoryOut:
+    receipt = None
+    if receipt_row is not None:
+        receipt = InventoryReceipt(
+            retired_uids=json.loads(receipt_row["retired_uids_json"]),
+            settled_tasks=[SettledTaskRef(**t) for t in json.loads(
+                receipt_row["settled_tasks_json"]
+            )],
+            unknown_uids=json.loads(receipt_row["unknown_uids_json"]),
+        )
+    return InventoryOut(
+        inventory_id=row["id"],
+        node=row["node"],
+        seq=row["seq"],
+        state=row["state"],
+        scope=json.loads(row["scope_json"]),
+        submitted_uids=json.loads(row["uids_json"]) if row["uids_json"] else None,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        completed_at=row["completed_at"],
+        receipt=receipt,
+        duplicate=duplicate,
+    )
+
+
+def issue_inventory(node: str) -> InventoryOut:
+    conn = _connect()
+    try:
+        with db.transaction(conn, immediate=True):
+            _ensure_node(conn, node)
+            ts = now_iso()
+            seq_row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq"
+                " FROM inventories WHERE node = ?",
+                (node,),
+            ).fetchone()
+            seq = seq_row["next_seq"]
+            scope = [
+                r["uid"]
+                for r in conn.execute(
+                    "SELECT uid FROM pods WHERE node = ? AND state = 'active'"
+                    " ORDER BY uid",
+                    (node,),
+                ).fetchall()
+            ]
+            inventory_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO inventories(id, node, seq, state, scope_json,"
+                " uids_json, created_at, updated_at, completed_at)"
+                " VALUES (?, ?, ?, 'open', ?, NULL, ?, ?, NULL)",
+                (inventory_id, node, seq, json.dumps(scope), ts, ts),
+            )
+            row = conn.execute(
+                "SELECT * FROM inventories WHERE id = ?", (inventory_id,)
+            ).fetchone()
+            return _inventory_out(row, None)
+    finally:
+        conn.close()
+
+
+def submit_inventory(inventory_id: str, uids: list[str]) -> InventoryOut:
+    conn = _connect()
+    try:
+        with db.transaction(conn, immediate=True):
+            row = conn.execute(
+                "SELECT * FROM inventories WHERE id = ?", (inventory_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"inventory {inventory_id!r} not found")
+
+            receipt_row = conn.execute(
+                "SELECT * FROM inventory_receipts WHERE inventory_id = ?",
+                (inventory_id,),
+            ).fetchone()
+            if row["state"] == "completed" and receipt_row is not None:
+                # Exact replay returns the original receipt; a different list
+                # is a conflict so a stale agent cannot overwrite the outcome.
+                stored_uids = set(json.loads(row["uids_json"]))
+                if stored_uids == set(uids):
+                    return _inventory_out(row, receipt_row, duplicate=True)
+                raise Conflict(
+                    f"inventory {inventory_id!r} already completed with a different"
+                    " uid list; start a new inventory"
+                )
+            if row["state"] == INVENTORY_SUPERSEDED:
+                raise Conflict(
+                    f"inventory {inventory_id!r} was superseded by a later inventory"
+                    f" for node {row['node']!r}"
+                )
+
+            ts = now_iso()
+            scope = json.loads(row["scope_json"])
+            present = set(uids)
+            missing = [uid for uid in scope if uid not in present]
+
+            retired_uids: list[str] = []
+            settled_tasks: list[dict[str, Any]] = []
+            for uid in missing:
+                pod = conn.execute(
+                    "SELECT * FROM pods WHERE uid = ?", (uid,)
+                ).fetchone()
+                # Only pods still active inside the frozen scope are retired.
+                # Pods that vanished (evicted/removed) between issue and
+                # submit are already terminal and are left untouched.
+                if pod is None or pod["state"] != ACTIVE:
+                    continue
+                settled_rows = _retire_active_pod(
+                    conn, uid, note=INVENTORY_NOTE, ts=ts
+                )
+                retired_uids.append(uid)
+                for task in settled_rows:
+                    settled_tasks.append(
+                        {
+                            "task_id": task["id"],
+                            "pod_uid": task["pod_uid"],
+                            "workload": task["workload"],
+                            "result_note": INVENTORY_NOTE,
+                        }
+                    )
+
+            known_uids = {
+                r["uid"] for r in conn.execute("SELECT uid FROM pods").fetchall()
+            }
+            # "Not registered" means the coordinator has no record of the uid
+            # at all.  A submitted uid belonging to an already-retired pod is
+            # known, so it is reported nowhere as an error.
+            unknown_uids = sorted(uid for uid in uids if uid not in known_uids)
+
+            retired_uids.sort()
+            settled_tasks.sort(key=lambda t: t["task_id"])
+            submitted = sorted(uids)
+            conn.execute(
+                "UPDATE inventories SET state = 'completed', uids_json = ?,"
+                " updated_at = ?, completed_at = ? WHERE id = ?",
+                (json.dumps(submitted), ts, ts, inventory_id),
+            )
+            # Fence: once this inventory is effective, older open inventories
+            # for the same node can never take effect.
+            conn.execute(
+                "UPDATE inventories SET state = 'superseded', updated_at = ?"
+                " WHERE node = ? AND seq < ? AND state = 'open'",
+                (ts, row["node"], row["seq"]),
+            )
+            receipt = {
+                "retired_uids": retired_uids,
+                "settled_tasks": settled_tasks,
+                "unknown_uids": unknown_uids,
+            }
+            conn.execute(
+                "INSERT INTO inventory_receipts(inventory_id, node,"
+                " retired_uids_json, settled_tasks_json, unknown_uids_json,"
+                " payload_json, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    inventory_id,
+                    row["node"],
+                    json.dumps(retired_uids),
+                    json.dumps(settled_tasks),
+                    json.dumps(unknown_uids),
+                    json.dumps(receipt),
+                    ts,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM inventories WHERE id = ?", (inventory_id,)
+            ).fetchone()
+            receipt_row = conn.execute(
+                "SELECT * FROM inventory_receipts WHERE inventory_id = ?",
+                (inventory_id,),
+            ).fetchone()
+            return _inventory_out(row, receipt_row)
+    finally:
+        conn.close()
+
+
+def get_inventory(inventory_id: str) -> InventoryOut:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM inventories WHERE id = ?", (inventory_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"inventory {inventory_id!r} not found")
+        receipt_row = conn.execute(
+            "SELECT * FROM inventory_receipts WHERE inventory_id = ?",
+            (inventory_id,),
+        ).fetchone()
+        return _inventory_out(row, receipt_row)
+    finally:
+        conn.close()
+
+
+def list_inventories(node: str | None = None) -> list[InventoryOut]:
+    conn = _connect()
+    try:
+        if node is not None:
+            rows = conn.execute(
+                "SELECT * FROM inventories WHERE node = ? ORDER BY seq DESC, id",
+                (node,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM inventories ORDER BY node, seq DESC, id"
+            ).fetchall()
+        out: list[InventoryOut] = []
+        for row in rows:
+            receipt_row = conn.execute(
+                "SELECT * FROM inventory_receipts WHERE inventory_id = ?",
+                (row["id"],),
+            ).fetchone()
+            out.append(_inventory_out(row, receipt_row))
+        return out
     finally:
         conn.close()
 
